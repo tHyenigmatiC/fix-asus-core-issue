@@ -1,0 +1,308 @@
+#!/bin/bash
+# core3-fix - keep a faulty CPU core (core 3) out of Ubuntu and Windows.
+# ASUS TUF A15 FA506NCR, Ryzen 7 7435HS. See README.md for the full story.
+# Run "core3-fix help" for usage.
+set -euo pipefail
+
+# ---------------------------------------------------------------- settings
+BAD_CORE=3                 # physical core that corrupts data
+BAD_CPUS="6 7"             # its Linux CPU numbers
+BAD_APIC_IDS="6 7"         # its APIC IDs (what the firmware/Windows sees)
+WIN_THREADS_SAFE=6         # Windows "first N threads" that avoid core 3
+WIN_ESP_UUID=1679-F4EB     # Windows EFI partition ("SYSTEM" on the Samsung SSD)
+
+LIB=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/lib
+BACKUPS=/var/backups/core3-fix
+OLD_BACKUPS=/var/backups/windows-bcd          # used by the first version
+GRUB_DEFAULT=/etc/default/grub
+GRUB_ENTRY=/etc/grub.d/42_windows_skip_core3
+MADT_OUT=/boot/acpi/madt-skip-core3.aml
+SVC=/etc/systemd/system/skip-bad-core.service
+SVC_SCRIPT=/usr/local/sbin/skip-bad-core.sh
+ESP_MNT=/mnt/core3-fix-windows-esp
+
+# ---------------------------------------------------------------- helpers
+if [ -t 1 ]; then G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' N=$'\e[0m'; else G= Y= R= N=; fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %s✔%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "this needs root - run: sudo core3-fix $*"; }
+
+backup_once() {   # backup_once FILE NAME  - keep the very first copy forever
+    mkdir -p "$BACKUPS"
+    [ -e "$BACKUPS/$2" ] || cp "$1" "$BACKUPS/$2"
+}
+
+need_hivex() {
+    python3 -c "import hivex" 2>/dev/null && return
+    say "Installing python3-hivex (BCD editor) from Ubuntu's repository..."
+    apt-get install -y python3-hivex >/dev/null
+}
+
+mount_esp() {
+    mkdir -p "$ESP_MNT"
+    mountpoint -q "$ESP_MNT" || mount -t vfat "UUID=$WIN_ESP_UUID" "$ESP_MNT" \
+        || die "could not mount the Windows EFI partition (UUID $WIN_ESP_UUID)"
+    BCD="$ESP_MNT/EFI/Microsoft/Boot/BCD"
+    [ -f "$BCD" ] || die "no Windows BCD at $BCD"
+    trap 'sync; umount "$ESP_MNT" 2>/dev/null || true' EXIT
+    # Prefer the oldest original we have, from either backup location.
+    if [ ! -e "$BACKUPS/BCD.original" ] && [ -e "$OLD_BACKUPS/BCD.original" ]; then
+        mkdir -p "$BACKUPS"; cp "$OLD_BACKUPS/BCD.original" "$BACKUPS/BCD.original"
+    fi
+    backup_once "$BCD" BCD.original
+}
+
+bcd() {   # bcd show | set N | remove   (edits a copy, then replaces)
+    need_hivex
+    if [ "$1" = show ]; then python3 -I "$LIB/bcd_numproc.py" "$BCD" show; return; fi
+    cp "$BCD" "$BACKUPS/BCD.$(date +%Y%m%d-%H%M%S)"
+    local work; work=$(mktemp)
+    cp "$BCD" "$work"
+    python3 -I "$LIB/bcd_numproc.py" "$work" "$@" >/dev/null
+    cp "$work" "$BCD"; rm -f "$work"
+    python3 -I "$LIB/bcd_numproc.py" "$BCD" show
+}
+
+grub_set_maxcpus() {   # grub_set_maxcpus N | grub_set_maxcpus off
+    backup_once "$GRUB_DEFAULT" grub.original
+    sed -i 's/maxcpus=[0-9]* \?//' "$GRUB_DEFAULT"
+    [ "$1" = off ] || sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"/&maxcpus=$1 /" "$GRUB_DEFAULT"
+}
+
+grub_os_prober() {     # grub_os_prober on|off  (GRUB's automatic Windows entry)
+    backup_once "$GRUB_DEFAULT" grub.original
+    local v=false; [ "$1" = off ] && v=true
+    if grep -q '^#\?GRUB_DISABLE_OS_PROBER=' "$GRUB_DEFAULT"; then
+        sed -i "s/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=$v/" "$GRUB_DEFAULT"
+    else
+        echo "GRUB_DISABLE_OS_PROBER=$v" >> "$GRUB_DEFAULT"
+    fi
+}
+
+update_grub() { update-grub >/dev/null 2>&1 || die "update-grub failed - run it by hand to see why"; ok "GRUB menu regenerated"; }
+
+secure_boot() { mokutil --sb-state 2>/dev/null | grep -q enabled && echo on || echo off; }
+
+# ---------------------------------------------------------------- ubuntu
+ubuntu_on() {
+    need_root ubuntu on
+    install -m 755 "$LIB/skip-bad-core.sh" "$SVC_SCRIPT"
+    install -m 644 "$LIB/skip-bad-core.service" "$SVC"
+    systemctl daemon-reload
+    systemctl enable skip-bad-core.service >/dev/null 2>&1
+    ok "boot service installed (adds every core except core $BAD_CORE)"
+    grub_set_maxcpus 3
+    ok "kernel starts on cores 0-2 only (maxcpus=3)"
+    update_grub
+    systemctl restart skip-bad-core.service
+    ok "applied now: CPUs online $(cat /sys/devices/system/cpu/online)"
+}
+
+ubuntu_off() {
+    need_root ubuntu off
+    systemctl disable skip-bad-core.service >/dev/null 2>&1 || true
+    rm -f "$SVC" "$SVC_SCRIPT"; systemctl daemon-reload
+    grub_set_maxcpus off
+    update_grub
+    ok "Ubuntu will use all 16 threads from the next boot (including core $BAD_CORE)"
+}
+
+# ---------------------------------------------------------------- windows
+windows_7() {
+    need_root windows 7
+    mkdir -p "$BACKUPS" "$(dirname "$MADT_OUT")"
+    backup_once /sys/firmware/acpi/tables/APIC APIC.original
+    # Always build from the live firmware table, so a BIOS update is picked up.
+    python3 -I "$LIB/patch_madt.py" /sys/firmware/acpi/tables/APIC "$MADT_OUT" $BAD_APIC_IDS | sed 's/^/  /'
+    local boot_uuid; boot_uuid=$(findmnt -no UUID /boot)
+    cat > "$GRUB_ENTRY" <<EOF
+#!/bin/sh
+# Written by core3-fix. Starts Windows with core $BAD_CORE hidden from it.
+cat <<'MENU'
+menuentry "Windows 11 (7 cores, skip core 3)" --class windows {
+    insmod part_gpt
+    insmod fat
+    insmod ext2
+    search --no-floppy --fs-uuid --set=acpifs $boot_uuid
+    if acpi --exclude=APIC (\$acpifs)/acpi/$(basename "$MADT_OUT"); then
+        search --no-floppy --fs-uuid --set=root $WIN_ESP_UUID
+        chainloader /EFI/Microsoft/Boot/bootmgfw.efi
+    else
+        echo "Could not load the patched CPU table (is Secure Boot still on?)."
+        echo "Not starting Windows - it would use core 3. Returning to the menu..."
+        sleep 10
+    fi
+}
+MENU
+EOF
+    chmod 755 "$GRUB_ENTRY"
+    ok "GRUB entry \"Windows 11 (7 cores, skip core 3)\" written"
+    grub_os_prober off
+    ok "GRUB's plain Windows entry hidden (it would use core $BAD_CORE)"
+    update_grub
+    mount_esp; bcd remove | sed 's/^/  /'
+    ok "Windows thread limit removed (it uses all 14 threads it is shown)"
+    say
+    [ "$(secure_boot)" = on ] && warn "Secure Boot is ON - turn it off in the BIOS (F2 > Security), or the new entry will refuse to start."
+    warn "Start Windows ONLY from the GRUB entry. The BIOS boot menu (F8) skips the patch."
+    warn "First boot may ask for the BitLocker key - see: core3-fix help bitlocker"
+}
+
+windows_6() {
+    need_root windows 6
+    rm -f "$GRUB_ENTRY" "$MADT_OUT"
+    grub_os_prober on
+    update_grub
+    mount_esp; bcd set "$WIN_THREADS_SAFE" | sed 's/^/  /'
+    ok "Windows limited to its first $WIN_THREADS_SAFE threads (cores 0-2). Works with Secure Boot on, from any boot menu."
+}
+
+windows_off() {
+    need_root windows off
+    rm -f "$GRUB_ENTRY" "$MADT_OUT"
+    grub_os_prober on
+    update_grub
+    mount_esp; bcd remove | sed 's/^/  /'
+    ok "Windows uses all 16 threads again (only safe after the board/CPU is repaired)"
+}
+
+windows_show() { need_root windows show; mount_esp; bcd show; }
+
+# ---------------------------------------------------------------- status / check
+status() {
+    say "Ubuntu"
+    local online; online=$(cat /sys/devices/system/cpu/online)
+    say "  CPUs online now:   $online   (core $BAD_CORE = CPUs ${BAD_CPUS// /,})"
+    if [ -e "$SVC" ] && systemctl is-enabled -q skip-bad-core.service 2>/dev/null; then
+        ok "skip-core-$BAD_CORE boot service: installed"
+    else
+        warn "skip-core-$BAD_CORE boot service: not installed"
+    fi
+    local m; m=$(grep -o 'maxcpus=[0-9]*' "$GRUB_DEFAULT" || true)
+    say "  GRUB kernel option: ${m:-none}   (this boot: $(grep -o 'maxcpus=[0-9]*' /proc/cmdline || echo none))"
+    say
+    say "Windows"
+    if [ -e "$GRUB_ENTRY" ]; then
+        ok "mode 7: GRUB entry \"Windows 11 (7 cores, skip core 3)\" installed"
+    else
+        say "  GRUB 7-core entry: not installed"
+    fi
+    say "  Secure Boot: $(secure_boot)"
+    if [ "$(id -u)" = 0 ]; then
+        mount_esp; bcd show
+    else
+        say "  (run with sudo to read Windows' thread limit from its BCD)"
+    fi
+    say
+    say "Backups: $BACKUPS"
+    ls "$BACKUPS" 2>/dev/null | sed 's/^/  /' || say "  none yet"
+}
+
+check() {   # check [DAYS]
+    local days=${1:-7}
+    local since; since=$(date -d "-$days days" '+%F %T')
+    say "Boots in the last $days days (a boot that ended without a clean shutdown = crash):"
+    journalctl --list-boots --no-pager -o json 2>/dev/null | python3 -I -c '
+import json, sys, datetime, subprocess
+days = int(sys.argv[1])
+since = datetime.datetime.now() - datetime.timedelta(days=days)
+crashes = total = 0
+for b in json.load(sys.stdin):
+    start = datetime.datetime.fromtimestamp(b["first_entry"] / 1e6)
+    if start < since:
+        continue
+    total += 1
+    up = (b["last_entry"] - b["first_entry"]) / 1e6
+    if b["index"] == 0:
+        tag = "running now"
+    else:
+        clean = subprocess.run(["journalctl", "-b", b["boot_id"], "-t", "systemd-shutdown",
+                                "-q", "--no-pager", "-n", "1"], capture_output=True).stdout.strip()
+        tag = "shut down normally" if clean else "CRASH"
+    crashes += tag == "CRASH"
+    print(f"  {start:%m-%d %H:%M}  up {up:8.0f}s  {tag}")
+print(f"\n  {crashes} crash(es) in {total} boots")
+' "$days"
+    say
+    say "Programs killed by corrupted data in the last $days days (look for 'on CPU 6/7'):"
+    local hits
+    hits=$(journalctl _TRANSPORT=kernel --no-pager -S "$since" 2>/dev/null | grep -E "segfault at|general protection|Bad rss-counter" || true)
+    if [ -z "$hits" ]; then ok "none"; else echo "$hits" | cut -c1-180 | sed 's/^/  /'; fi
+}
+
+gpu_test_remove() {
+    need_root gpu-test-remove
+    systemctl disable --now gpu-crash-test.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/gpu-crash-test.service /usr/local/bin/gpu-crash-test.sh /usr/local/bin/gpu-test-report
+    systemctl daemon-reload
+    systemctl enable ollama.service >/dev/null 2>&1 && ok "ollama starts at boot again"
+    ok "old GPU test removed (its log stays in /var/log/gpu-crash-test.log)"
+}
+
+restore() {
+    need_root restore
+    ubuntu_off
+    rm -f "$GRUB_ENTRY" "$MADT_OUT"
+    grub_os_prober on
+    update_grub
+    mount_esp
+    [ -e "$BACKUPS/BCD.original" ] || die "no original BCD backup found"
+    cp "$BCD" "$BACKUPS/BCD.before-restore.$(date +%Y%m%d-%H%M%S)"
+    cp "$BACKUPS/BCD.original" "$BCD"
+    ok "original Windows BCD put back"
+    warn "Everything is back to how it was before the fix: core $BAD_CORE is used again by both systems."
+}
+
+# ---------------------------------------------------------------- help
+help() {
+    case "${1:-}" in
+    bitlocker) cat <<'EOF'
+BitLocker asks for the recovery key when the way Windows is started changes
+(Secure Boot turned off/on, a new BIOS, sometimes a GRUB update).
+
+  1. Get the key: https://account.microsoft.com/devices/recoverykey
+  2. Type it in at the blue BitLocker screen.
+  3. In Windows, open Terminal as administrator and run:
+       manage-bde -protectors -disable C:
+       manage-bde -protectors -enable C:
+     (pause + resume = BitLocker trusts the current way of booting)
+EOF
+    ;;
+    *) cat <<EOF
+core3-fix - keep faulty CPU core $BAD_CORE out of Ubuntu and Windows
+
+  core3-fix status              what is active right now (sudo shows Windows too)
+  core3-fix check [DAYS]        crashes and corrupted-data errors (default 7 days)
+
+  sudo core3-fix ubuntu on      Ubuntu on 7 cores / 14 threads, skipping core $BAD_CORE
+  sudo core3-fix ubuntu off     Ubuntu on all 16 threads (after repair)
+
+  sudo core3-fix windows 7      Windows on 7 cores via GRUB entry (Secure Boot must be OFF)
+  sudo core3-fix windows 6      Windows on first 6 threads (cores 0-2), works with Secure Boot on
+  sudo core3-fix windows off    Windows on all 16 threads (after repair)
+  sudo core3-fix windows show   show Windows' current thread limit
+
+  sudo core3-fix restore        undo everything, put original files back
+  sudo core3-fix gpu-test-remove  remove the old GPU-wake test, restart ollama at boot
+  core3-fix help bitlocker      what to do when BitLocker asks for the key
+
+Backups of every original file: $BACKUPS
+EOF
+    ;;
+    esac
+}
+
+# ---------------------------------------------------------------- main
+case "${1:-help}" in
+    status)          status ;;
+    check)           check "${2:-7}" ;;
+    ubuntu)          case "${2:-}" in on) ubuntu_on ;; off) ubuntu_off ;; *) die "use: core3-fix ubuntu on|off" ;; esac ;;
+    windows)         case "${2:-}" in 7) windows_7 ;; 6) windows_6 ;; off) windows_off ;; show) windows_show ;;
+                                      *) die "use: core3-fix windows 7|6|off|show" ;; esac ;;
+    restore)         restore ;;
+    gpu-test-remove) gpu_test_remove ;;
+    help|-h|--help)  help "${2:-}" ;;
+    *)               die "unknown command '$1' - see: core3-fix help" ;;
+esac

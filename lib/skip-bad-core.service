@@ -1,0 +1,13 @@
+[Unit]
+Description=Bring up all CPU cores except faulty core 3
+DefaultDependencies=no
+Before=sysinit.target
+ConditionPathExists=/sys/devices/system/cpu/online
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/skip-bad-core.sh
+
+[Install]
+WantedBy=sysinit.target

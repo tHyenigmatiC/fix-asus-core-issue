@@ -1,0 +1,10 @@
+[Unit]
+Description=Delayed GPU-wake crash test
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gpu-crash-test.sh
+
+[Install]
+WantedBy=multi-user.target
